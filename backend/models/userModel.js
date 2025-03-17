@@ -82,15 +82,21 @@ const userSchema = new mongoose.Schema(
       default: "Medium",
     },
     customerPriorityScore: {
-      type: Number,
-      default: 0,
-    },
-    customerPriorityScore: {
+      // Note: You had this twice; keeping only one
       type: Number,
       default: 0,
     },
     lastLogin: {
       type: Date,
+    },
+    // New fields added below
+    averageHoldings: {
+      type: Number, // Stored in rupees, e.g., 1600000 for 16 lakhs
+      default: 0,
+    },
+    isActive: {
+      type: Boolean,
+      default: true, // Assume user is active by default when created
     },
   },
   {

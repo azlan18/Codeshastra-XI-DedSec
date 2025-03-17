@@ -79,26 +79,80 @@ async function assignTicketToEmployee(ticket, employee) {
     employeeId: employee.id,
     assignedAt: new Date(),
     workDone: "",
+    priorityScore: ticket.priorityScore,
   });
   employee.isFree = false;
   employee.currentTicket = {
     ticketId: ticket.ticketId,
     domain: ticket.domain,
+    priorityScore: ticket.priorityScore,
   };
   await ticket.save();
 }
 
 async function assignTicket(ticket) {
-  const eligibleEmployees = employees.filter(
-    emp => isEligibleEmployee(emp, ticket.domain) && emp.isFree
-  );
-  if (eligibleEmployees.length > 0) {
-    const employee = eligibleEmployees[0];
-    await assignTicketToEmployee(ticket, employee);
-    ticket.status = "Assigned";
-  } else {
+  try {
+    // First, try to find completely free employees
+    let eligibleEmployees = employees.filter(
+      emp => isEligibleEmployee(emp, ticket.domain) && emp.isFree
+    );
+
+    if (eligibleEmployees.length > 0) {
+      // Assign to the first available free employee
+      const employee = eligibleEmployees[0];
+      await assignTicketToEmployee(ticket, employee);
+      ticket.status = "Assigned";
+      await ticket.save();
+      return;
+    }
+
+    // If no free employees, check employees working on lower priority tickets
+    const allEligibleEmployees = employees.filter(emp => isEligibleEmployee(emp, ticket.domain));
+
+    if (allEligibleEmployees.length === 0) {
+      ticket.status = "Queued";
+      await ticket.save();
+      return;
+    }
+
+    // Find an employee working on a lower priority ticket
+    for (const employee of allEligibleEmployees) {
+      if (!employee.currentTicket) continue;
+
+      const currentTicket = await Ticket.findOne({
+        ticketId: employee.currentTicket.ticketId,
+      });
+
+      if (currentTicket && currentTicket.priorityScore < ticket.priorityScore) {
+        // Put the current ticket on hold
+        currentTicket.status = "On Hold";
+        await currentTicket.save();
+
+        // Free up the employee
+        employee.isFree = true;
+        employee.currentTicket = null;
+
+        // Assign the new higher priority ticket
+        await assignTicketToEmployee(ticket, employee);
+        ticket.status = "Assigned";
+        await ticket.save();
+        return;
+      }
+    }
+
+    // If no suitable employee found, queue the ticket
     ticket.status = "Queued";
     await ticket.save();
+
+    // Sort queued tickets by priority
+    await Ticket.updateMany(
+      { status: "Queued" },
+      { $set: { updatedAt: new Date() } },
+      { sort: { priorityScore: -1 } }
+    );
+  } catch (error) {
+    console.error("Error in assignTicket:", error);
+    throw error;
   }
 }
 
@@ -214,12 +268,11 @@ router.post("/process", async (req, res) => {
     let selectedDepartment;
     if (Array.isArray(department)) {
       const validDepartments = department.filter(
-        (d) => d && typeof d === "string" && d.trim() !== ""
+        d => d && typeof d === "string" && d.trim() !== ""
       );
       selectedDepartment = validDepartments.length > 0 ? validDepartments[0] : null;
     } else {
-      selectedDepartment =
-        department && typeof department === "string" ? department.trim() : null;
+      selectedDepartment = department && typeof department === "string" ? department.trim() : null;
     }
     console.log("Selected department:", selectedDepartment);
 
@@ -230,7 +283,7 @@ router.post("/process", async (req, res) => {
       "Wealth Management & Deposit Services",
       "Regulatory & Compliance Department",
     ];
-    console.log("Allowed domains:", allowedDomains);
+    // console.log("Allowed domains:", allowedDomains);
 
     if (!selectedDepartment || !allowedDomains.includes(selectedDepartment)) {
       console.log(
@@ -293,7 +346,6 @@ router.post("/process", async (req, res) => {
   }
 });
 
-
 // Public routes
 router.post("/customer/login", async (req, res) => {
   try {
@@ -310,7 +362,7 @@ router.post("/customer/login", async (req, res) => {
 
     const token = jwt.sign(
       { id: user._id, email: user.email, type: "customer" },
-       "your-secret-key",
+      "your-secret-key",
       { expiresIn: "1d" }
     );
 
@@ -343,11 +395,9 @@ router.post("/employee/login", async (req, res) => {
       return res.status(401).json({ error: "Invalid credentials" });
     }
 
-    const token = jwt.sign(
-      { id: employee.id, type: "employee" },
-      "your-secret-key",
-      { expiresIn: "1d" }
-    );
+    const token = jwt.sign({ id: employee.id, type: "employee" }, "your-secret-key", {
+      expiresIn: "1d",
+    });
 
     res.status(200).json({
       token,
@@ -469,17 +519,14 @@ router.post("/tickets/complete", async (req, res) => {
     await ticket.save();
 
     if (freedEmployee) {
-      const queuedTicket = await Ticket.findOne({ status: "Queued" }).sort({ createdAt: 1 });
-      if (queuedTicket && isEligibleEmployee(freedEmployee, queuedTicket.domain)) {
-        await assignTicketToEmployee(queuedTicket, freedEmployee);
-      } else {
-        const heldTicket = await Ticket.findOne({
-          "assignedEmployees.employeeId": freedEmployee.id,
-          status: "On Hold",
-        }).sort({ updatedAt: -1 });
-        if (heldTicket) {
-          await assignTicketToEmployee(heldTicket, freedEmployee);
-        }
+      // Check highest priority queued ticket first
+      const queuedTicket = await Ticket.findOne({
+        status: "Queued",
+        domain: { $in: freedEmployee.domains },
+      }).sort({ priorityScore: -1, createdAt: 1 });
+
+      if (queuedTicket) {
+        await assignTicket(queuedTicket);
       }
     }
 
@@ -545,6 +592,8 @@ router.post("/tickets/resume", async (req, res) => {
       if (currentTicket) {
         currentTicket.status = "On Hold";
         await currentTicket.save();
+        employee.isFree = true;
+        employee.currentTicket = null;
       }
     }
 
@@ -667,8 +716,6 @@ router.post("/loan/assessment", async (req, res) => {
     res.status(400).json({ error: error.message });
   }
 });
-
-
 
 router.post("/upload", upload.single("file"), async (req, res) => {
   try {
